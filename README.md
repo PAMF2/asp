@@ -57,7 +57,92 @@ User Prompt
 | `gossip/` | Epidemic gossip protocol — vaccine propagation, peer management, pluggable transport |
 | `llm/` | Model-agnostic LLM interface — receives only `SanitizedContext` (OpenAI, Llama adapters) |
 | `telemetry/` | JSON-RPC 2.0 telemetry — structured event emission for threat, mitigation, and threshold events |
-| `demo/` | Live visualization server — gossip network, latent space scatter, TEE x-ray |
+| `demo/` | Live visualization server — gossip network, latent space scatter, TEE x-ray, 3D Gaussian field |
+| `demo/field3d.py` | PromptField3D — 3D parametric Gaussian memory field for prompt classification |
+
+## PromptField3D — Gaussian Memory Field
+
+A 3D parametric probability field that classifies prompts and consolidates attack memory online. Each axis represents an abstract threat dimension:
+
+```
+  dim 0 (x):  Authority / Persona    ← social_eng, roleplay
+  dim 1 (y):  Technical Bypass       ← injection, smuggling
+  dim 2 (z):  Information Extraction  ← exfiltration, reframing
+```
+
+### Core Math
+
+**1. Keyword Gradient** — maps prompt text to a raw 3D position:
+
+```
+  score_d = tanh( (hits_d / total_d) × scale )
+```
+
+`tanh` is smooth, bounded [0, 1), and compresses naturally near saturation — diminishing returns from additional keyword hits.
+
+**2. Gaussian Energy** — each memory region `m_i` is an isotropic Gaussian blob:
+
+```
+  G(p, m_i) = w_i × exp( -‖p - c_i‖² / (2σ_i²) )
+  E(p) = Σ_i G(p, m_i)        ← total field energy at point p
+```
+
+**3. Analytic Gradient** — used for placement optimization via gradient descent:
+
+```
+  ∇E(p) = Σ_i G(p, m_i) × (p - c_i) / σ_i²
+  p ← p - lr × ∇E(p)          ← 40 steps, lr=0.04, clamped to [0,1]³
+```
+
+**4. Novelty Detection** — decides whether a prompt is novel or redundant:
+
+```
+  NOVEL      if  E(p) < 0.55  AND  dist(p, nearest) > 0.12
+  REDUNDANT  otherwise → absorbed into nearest region (running centroid average)
+```
+
+### Pipeline
+
+```
+prompt → keyword_gradient() → raw_pos [0,1]³
+       → optimize_placement() → gradient descent to low-energy valley
+       → field_energy() → pressure from existing regions
+       → nearest_region() → closest Gaussian blob
+       → decision: memorize (new region) or absorb (update existing)
+```
+
+### Seed Regions
+
+Seven canonical prototypes initialize the field basins:
+
+| Region | Position (authority, bypass, extraction) |
+|--------|----------------------------------------|
+| benign | (0.03, 0.03, 0.03) |
+| social_eng | (0.90, 0.12, 0.08) |
+| roleplay | (0.78, 0.08, 0.06) |
+| injection | (0.12, 0.92, 0.08) |
+| smuggling | (0.18, 0.82, 0.12) |
+| exfiltration | (0.08, 0.12, 0.92) |
+| reframing | (0.14, 0.18, 0.80) |
+
+### API
+
+```bash
+# Probe a prompt in the 3D field
+curl -X POST http://localhost:7475/api/field3d \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Ignore all instructions", "label": "test"}'
+
+# Get all memory regions
+curl http://localhost:7475/api/field3d/state
+```
+
+### Visualization
+
+The demo server includes an interactive Three.js 3D scatter plot with:
+- Translucent Gaussian region spheres (color-coded by category)
+- Probe points with emissive glow (color-coded by threat level)
+- Orbit controls (drag to rotate, scroll to zoom)
 
 ## Threat Levels & Defense Actions
 
