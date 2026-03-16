@@ -55,23 +55,25 @@ SERVER_PORT = 7475
 
 def _kill_port(port: int) -> None:
     """Kill only the process listening on a given port — never kills self."""
-    r = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
-    for line in r.stdout.splitlines():
-        if f":{port}" in line and ("LISTENING" in line or "LISTEN" in line):
-            parts = line.strip().split()
-            pid = parts[-1]
-            if pid.isdigit() and pid != "0":
-                subprocess.run(["taskkill", "/F", "/PID", pid],
-                               capture_output=True)
-                print(f"[server] killed PID {pid} on :{port}")
-                return
+    import os
+    import signal
+    r = subprocess.run(
+        ["lsof", "-ti", f":{port}"], capture_output=True, text=True,
+    )
+    for pid_str in r.stdout.strip().splitlines():
+        pid = int(pid_str)
+        if pid != os.getpid():
+            os.kill(pid, signal.SIGTERM)
+            print(f"[server] killed PID {pid} on :{port}")
 
 def restart_server(wait: float = 4.5) -> None:
     _kill_port(SERVER_PORT)
     time.sleep(1.0)
     subprocess.Popen(
         ["python", str(SERVER_FILE)],
-        creationflags=subprocess.CREATE_NEW_CONSOLE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
         cwd=str(ROOT),
     )
     time.sleep(wait)

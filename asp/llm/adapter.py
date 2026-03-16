@@ -11,7 +11,7 @@ not on OpenAI/Llama/etc. directly.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from asp.types import SanitizedContext
 
@@ -22,7 +22,7 @@ class LLMResponse:
     content: str
     model: str
     usage: dict[str, int]   # {"prompt_tokens": N, "completion_tokens": M}
-    metadata: dict = None
+    metadata: dict[str, Any] | None = None
 
     def __post_init__(self):
         if self.metadata is None:

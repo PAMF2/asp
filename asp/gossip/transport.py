@@ -43,11 +43,12 @@ class InMemoryTransport:
     async def receive(self) -> tuple[str, str]:
         if self._inbox:
             return self._inbox.pop(0)
-        raise asyncio.QueueEmpty("No messages")
+        raise QueueEmpty("No messages")
 
     def inject_message(self, from_peer: str, message: str) -> None:
         """Test helper: inject a message into the inbox."""
         self._inbox.append((from_peer, message))
 
 
-import asyncio  # noqa: E402 (needed for QueueEmpty reference)
+class QueueEmpty(Exception):
+    """Raised when the transport inbox has no pending messages."""

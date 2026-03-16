@@ -14,10 +14,12 @@ class NodeRegistry:
 
     def __init__(self) -> None:
         self._nodes: dict[str, ValidatorNode] = {}
+        self._next_share_index: int = 1
 
     def register(self, node: ValidatorNode) -> None:
         """Register a node and assign its share index."""
-        node.share_index = len(self._nodes) + 1
+        node.share_index = self._next_share_index
+        self._next_share_index += 1
         self._nodes[node.node_id] = node
 
     def get(self, node_id: str) -> ValidatorNode | None:

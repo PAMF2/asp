@@ -107,13 +107,14 @@ class TelemetryEmitter:
             return
 
         batch = create_batch(self._buffer)
+        count = len(self._buffer)
         self._buffer.clear()
 
         # In production, send via HTTP POST to telemetry endpoint.
         # For hackathon, log the batch.
         logger.info(
             "Telemetry batch sent (%d events) to %s",
-            len(self._buffer),
+            count,
             self._config.telemetry_endpoint,
         )
         # Placeholder for actual HTTP transport:

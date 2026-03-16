@@ -166,9 +166,14 @@ class GossipEngine:
 
         for vaccine in vaccines_to_send:
             wire = vaccine_to_wire(vaccine)
+            any_success = False
             for peer in targets:
                 if not peer.has_seen(vaccine.signature_hash):
                     success = await self._transport.send(peer, wire)
                     if success:
+                        any_success = True
                         peer.mark_seen(vaccine.signature_hash)
                         peer.last_contact = time.time()
+            # Re-queue vaccine if no peer received it
+            if not any_success:
+                self._pending.append(vaccine)

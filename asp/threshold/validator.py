@@ -91,6 +91,14 @@ class ThresholdValidator:
                 timeout=self._config.validation_timeout_s,
             )
         except asyncio.TimeoutError:
+            # Fail closed: if we intended to reject, maintain rejection on timeout
+            if proposed_verdict == Verdict.REJECTED:
+                return ThresholdSignatureBlock(
+                    verdict=Verdict.REJECTED,
+                    request_id=request_id,
+                    threshold=threshold,
+                    total_nodes=total,
+                )
             results = []
 
         for result in results:

@@ -4611,33 +4611,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "node": node})
 
         elif path == "/api/probe":
-            # Just check geometry — no gossip
+            # Pure geometric detection — no keyword gate.
+            # The encoder projects the prompt into latent space and
+            # classifies threat via cosine similarity to attack manifolds.
             prompt = body.get("prompt", "").strip()
-            # Keyword gate: pure-noise embeddings (0 keyword hits) can
-            # accidentally exceed the monitor threshold — always BENIGN.
-            if not adapter.has_attack_signal(prompt):
-                embed = adapter.embed(prompt)
-                x, y = projector.project(embed)
-                bus.publish("new_embedding", {
-                    "x": round(x, 4), "y": round(y, 4),
-                    "label": "probe", "similarity": 0.0, "threat": "BENIGN",
-                })
-                self._json({
-                    "x": round(x, 4), "y": round(y, 4),
-                    "similarity": 0.0, "threat": "BENIGN", "nearest": "none",
-                })
-                return
             vec = encoder.encode(prompt)
             x, y = projector.project(vec.embedding)
-            # Keyword floor: if attack signal detected but seed-DB drift pushed
-            # similarity below monitor_threshold, guarantee at least MONITOR.
             threat_name = vec.threat_level.name
             sim = vec.max_attack_similarity
-            if threat_name == "BENIGN":
-                from asp.config import ASPConfig as _Cfg
-                floor_sim = _Cfg().monitor_threshold + 0.01
-                sim = floor_sim
-                threat_name = "MONITOR"
             bus.publish("new_embedding", {
                 "x": round(x, 4), "y": round(y, 4),
                 "label": "probe",

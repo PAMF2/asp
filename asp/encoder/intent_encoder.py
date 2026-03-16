@@ -89,16 +89,24 @@ class MorphologicalIntentEncoder:
         - MONITOR: approaching the boundary
         - BENIGN: far from any known attack
         """
-        if similarity >= self._config.attack_similarity_threshold + 0.10:
+        # Thresholds define concentric zones around attack manifolds.
+        # With defaults (attack=0.82, monitor=0.65), the zones are:
+        #   QUARANTINE: >= 0.92
+        #   BLOCK:      >= 0.82
+        #   WARN:       >= 0.76  (2/3 of the way from monitor to attack)
+        #   MONITOR:    >= 0.65
+        #   BENIGN:     < 0.65
+        attack = self._config.attack_similarity_threshold
+        monitor = self._config.monitor_threshold
+        warn = monitor + (attack - monitor) * 2 / 3
+
+        if similarity >= attack + 0.10:
             return ThreatLevel.QUARANTINE
-        elif similarity >= self._config.attack_similarity_threshold:
+        elif similarity >= attack:
             return ThreatLevel.BLOCK
-        elif similarity >= (
-            self._config.attack_similarity_threshold
-            + self._config.monitor_threshold
-        ) / 2:
+        elif similarity >= warn:
             return ThreatLevel.WARN
-        elif similarity >= self._config.monitor_threshold:
+        elif similarity >= monitor:
             return ThreatLevel.MONITOR
         else:
             return ThreatLevel.BENIGN

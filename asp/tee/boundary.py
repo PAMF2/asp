@@ -85,16 +85,17 @@ class TEEBoundary:
         Raises:
             SecurityError: if threshold validation rejects the request.
         """
-        # Step 1: Sanitize (skeleton only -- no raw content in output)
-        sanitized = self._sanitizer.sanitize(raw_prompt)
+        try:
+            # Step 1: Sanitize (skeleton only -- no raw content in output)
+            sanitized = self._sanitizer.sanitize(raw_prompt)
 
-        # Step 2: Encode raw prompt into latent space
-        # This is the LAST time raw_prompt is accessed.
-        threat_vector = self._encoder.encode(raw_prompt)
-
-        # raw_prompt is now dead.  Python GC will collect it.
-        # In a real TEE, the enclave memory page is zeroed.
-        del raw_prompt
+            # Step 2: Encode raw prompt into latent space
+            # This is the LAST time raw_prompt is accessed.
+            threat_vector = self._encoder.encode(raw_prompt)
+        finally:
+            # raw_prompt is now dead.  Python GC will collect it.
+            # In a real TEE, the enclave memory page is zeroed.
+            del raw_prompt
 
         # Step 3: Route to defense module and get mitigation
         mitigation = self._defense_router.route(threat_vector, sanitized)
