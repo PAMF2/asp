@@ -23,6 +23,7 @@ def boundary(sanitizer, encoder, defense_router, threshold_validator):
     )
 
 
+@pytest.mark.asyncio
 class TestE2EPipeline:
     """Full pipeline integration tests."""
 

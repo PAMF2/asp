@@ -23,22 +23,28 @@ class TestSanitizerGateway:
         b = sanitizer.sanitize("prompt 2")
         assert a.request_id != b.request_id
 
-    def test_metadata_includes_token_count(self):
+    def test_metadata_contains_only_safe_fields(self):
+        """Metadata must not contain any prompt-derived features."""
         sanitizer = SanitizerGateway()
         result = sanitizer.sanitize("one two three four five")
-        assert result.metadata["token_count"] == 5
+        # Safe processing metadata should be present
+        assert "processed_at" in result.metadata
+        assert "asp_version" in result.metadata
+        # Prompt-derived features must NOT be present
+        assert "token_count" not in result.metadata
+        assert "has_code_blocks" not in result.metadata
+        assert "language_hint" not in result.metadata
+
+    def test_metadata_no_prompt_leakage_across_inputs(self):
+        """Different prompts must produce identical metadata keys."""
+        sanitizer = SanitizerGateway()
+        a = sanitizer.sanitize("short")
+        b = sanitizer.sanitize("a much longer prompt with many words " * 10)
+        c = sanitizer.sanitize("```python\nprint('hi')```")
+        # All should have the same metadata keys (no input-dependent fields)
+        assert set(a.metadata.keys()) == set(b.metadata.keys()) == set(c.metadata.keys())
 
     def test_custom_preamble(self):
         sanitizer = SanitizerGateway(preamble="Custom preamble here")
         result = sanitizer.sanitize("test")
         assert result.alignment_preamble == "Custom preamble here"
-
-    def test_language_detection_chinese(self):
-        sanitizer = SanitizerGateway()
-        result = sanitizer.sanitize("Hello world")
-        assert result.metadata["language_hint"] == "en"
-
-    def test_code_block_detection(self):
-        sanitizer = SanitizerGateway()
-        result = sanitizer.sanitize("Here is code: ```python\nprint('hi')```")
-        assert result.metadata["has_code_blocks"] is True

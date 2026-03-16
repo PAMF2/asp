@@ -46,6 +46,7 @@ class TestShamirSecretSharing:
         assert recovered == secret
 
 
+@pytest.mark.asyncio
 class TestThresholdValidator:
 
     async def test_benign_prompt_gets_verified(self, threshold_validator, config):

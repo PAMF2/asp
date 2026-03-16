@@ -18,8 +18,8 @@ commitment.
 
 from __future__ import annotations
 
-import re
 import uuid
+from datetime import datetime, timezone
 from typing import Protocol
 
 from asp.types import SanitizedContext
@@ -65,23 +65,17 @@ class SanitizerGateway:
 
         # The rewritten_prompt is empty at this stage.
         # The defense module will populate it after threat assessment.
+        # Metadata must contain ONLY processing-level information.
+        # No fields derived from the raw prompt content (token counts,
+        # structural features, language hints) -- these leak information
+        # about the original input and violate the raw-prompt
+        # non-disclosure invariant.
         return SanitizedContext(
             request_id=request_id,
             rewritten_prompt="",
             alignment_preamble=self._preamble,
             metadata={
-                "token_count": len(raw_prompt.split()),
-                "has_code_blocks": "```" in raw_prompt,
-                "language_hint": self._detect_language_hint(raw_prompt),
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+                "asp_version": "0.1.0",
             },
         )
-
-    @staticmethod
-    def _detect_language_hint(text: str) -> str:
-        """Lightweight language detection from surface features.
-        NOT semantic -- just script/charset heuristics."""
-        if re.search(r"[\u4e00-\u9fff]", text):
-            return "zh"
-        if re.search(r"[\u0400-\u04ff]", text):
-            return "ru"
-        return "en"
