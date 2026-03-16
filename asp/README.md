@@ -58,7 +58,7 @@ User Prompt
 | `llm/` | Model-agnostic LLM interface — receives only `SanitizedContext` (OpenAI, Llama adapters) |
 | `telemetry/` | JSON-RPC 2.0 telemetry — structured event emission for threat, mitigation, and threshold events |
 | `demo/` | Live visualization server — gossip network, latent space scatter, TEE x-ray, 3D Gaussian field |
-| `demo/field3d.py` | PromptField3D — 3D parametric Gaussian memory field for prompt classification |
+| `demo/field3d.py` | PromptFieldND — N-dimensional parametric Gaussian memory field for prompt classification |
 
 ## PromptFieldND — N-Dimensional Gaussian Memory Field
 
@@ -292,11 +292,36 @@ $ curl -s -X POST http://localhost:7475/api/probe \
 }
 ```
 
+## Bugs Fixed
+
+All issues found during code review have been resolved:
+
+| Module | Fix |
+|--------|-----|
+| `telemetry/emitter.py` | Buffer cleared before logging count — always reported 0 events |
+| `gossip/transport.py` | `asyncio.QueueEmpty` doesn't exist — replaced with custom exception |
+| `tee/boundary.py` | `raw_prompt` not deleted on exception — wrapped in `try/finally` |
+| `autoresearch.py` | Windows-only APIs (`taskkill`, `CREATE_NEW_CONSOLE`) — replaced with Linux equivalents |
+| `threshold/validator.py` | Timeout on BLOCK verdict was fail-open (`UNTRUSTED`) — now fail-closed (`REJECTED`) |
+| `gossip/engine.py` | Vaccines permanently lost on transport failure — now re-queued |
+| `gossip/vaccine.py` | No `signature_hash` verification — now validates hash against embedding (anti-poisoning) |
+| `threshold/registry.py` | `share_index` collision after `remove()` + re-register — monotonic counter |
+| `threshold/share.py` | `reconstruct_secret` used first-N slice — now sorts by index for correct reconstruction |
+| `encoder/intent_encoder.py` | WARN threshold midpoint formula too narrow — uses 2/3 interpolation |
+| `llm/adapter.py` | `LLMResponse.metadata` type annotation wrong (`dict` → `dict[str, Any] \| None`) |
+| `tee/sanitizer.py` | Metadata leaked prompt-derived features — replaced with safe processing fields |
+| `demo/viz_server.py` | Keyword gate bypassed geometric detection — removed, pure geometry now |
+| `test_field3d.py` | Used `exec()` with string search — refactored to proper imports |
+| `tests/test_e2e_pipeline.py` | Missing `@pytest.mark.asyncio` on async test class |
+| `tests/test_threshold_validator.py` | Missing `@pytest.mark.asyncio` on async test class |
+
 ## Architecture Details
 
 See `asp-whitepaper.tex` for formal treatment including:
 - Proof that a single compromised validator cannot produce `VERIFIED_IMMUNITY`
 - Surface-form invariance theorem for the morphological encoder
+- N-dimensional Gaussian memory field (PromptFieldND) with formal definitions
+- Empirical evaluation: 100-prompt attack suite with multilingual robustness
 - Gossip convergence analysis
 - Alignment tax trilemma (precision vs. recall vs. latency)
 

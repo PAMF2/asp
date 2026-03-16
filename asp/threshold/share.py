@@ -81,8 +81,8 @@ def reconstruct_secret(shares: list[Share], n: int) -> bytes:
     if len(shares) < n:
         raise ValueError(f"Need at least {n} shares, got {len(shares)}")
 
-    # Use exactly n shares (first n)
-    subset = shares[:n]
+    # Use exactly n shares — sort by index for deterministic reconstruction
+    subset = sorted(shares, key=lambda s: s.index)[:n]
 
     # Lagrange interpolation at x=0 to recover a_0 (the secret)
     secret_int = 0
