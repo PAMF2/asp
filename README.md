@@ -60,9 +60,11 @@ User Prompt
 | `demo/` | Live visualization server — gossip network, latent space scatter, TEE x-ray, 3D Gaussian field |
 | `demo/field3d.py` | PromptField3D — 3D parametric Gaussian memory field for prompt classification |
 
-## PromptField3D — Gaussian Memory Field
+## PromptFieldND — N-Dimensional Gaussian Memory Field
 
-A 3D parametric probability field that classifies prompts and consolidates attack memory online. Each axis represents an abstract threat dimension:
+An N-dimensional parametric probability field that classifies prompts and consolidates attack memory online. Each dimension maps one or more keyword categories to a scalar score. The math is dimension-agnostic — works identically in ℝ³, ℝ⁶, or ℝⁿ.
+
+**Default 3D layout** (backwards-compatible as `PromptField3D`):
 
 ```
   dim 0 (x):  Authority / Persona    ← social_eng, roleplay
@@ -72,51 +74,81 @@ A 3D parametric probability field that classifies prompts and consolidates attac
 
 ### Core Math
 
-**1. Keyword Gradient** — maps prompt text to a raw 3D position:
+All functions operate in ℝⁿ. `n` = number of dimensions = `len(dim_groups)`.
+
+**1. Keyword Gradient** — maps prompt text to a raw position in [0,1]ⁿ:
 
 ```
-  score_d = tanh( (hits_d / total_d) × scale )
+  For each dimension d ∈ {0, ..., n-1}:
+    density_d = max over categories in dim_groups[d] of (keyword_hits / total_keywords)
+    score_d   = tanh( density_d × scale )
+
+  Result: p ∈ [0, 1)ⁿ
 ```
 
 `tanh` is smooth, bounded [0, 1), and compresses naturally near saturation — diminishing returns from additional keyword hits.
 
-**2. Gaussian Energy** — each memory region `m_i` is an isotropic Gaussian blob:
+**2. Gaussian Energy** — each memory region `m_i` is an isotropic Gaussian blob in ℝⁿ:
 
 ```
-  G(p, m_i) = w_i × exp( -‖p - c_i‖² / (2σ_i²) )
-  E(p) = Σ_i G(p, m_i)        ← total field energy at point p
+  G(p, m_i) = w_i × exp( -‖p - c_i‖² / (2σ_i²) )     where ‖·‖ is the L2 norm in ℝⁿ
+  E(p)      = Σ_i G(p, m_i)                              total field energy at point p
 ```
 
-**3. Analytic Gradient** — used for placement optimization via gradient descent:
+**3. Analytic Gradient** — used for placement optimization via gradient descent in ℝⁿ:
 
 ```
-  ∇E(p) = Σ_i G(p, m_i) × (p - c_i) / σ_i²
-  p ← p - lr × ∇E(p)          ← 40 steps, lr=0.04, clamped to [0,1]³
+  ∇E(p) = Σ_i G(p, m_i) × (p - c_i) / σ_i²            gradient vector in ℝⁿ
+  p     ← p - lr × ∇E(p)                                 40 steps, lr=0.04
+  p     ← clamp(p, [0, 1]ⁿ)                              clamped to unit hypercube
 ```
 
 **4. Novelty Detection** — decides whether a prompt is novel or redundant:
 
 ```
-  NOVEL      if  E(p) < 0.55  AND  dist(p, nearest) > 0.12
-  REDUNDANT  otherwise → absorbed into nearest region (running centroid average)
+  NOVEL      if  E(p) < threshold  AND  ‖p - nearest_center‖ > min_distance
+  REDUNDANT  otherwise → absorbed into nearest region via running centroid average:
+               c_new = (c_old × count + p) / (count + 1)
 ```
 
-### N-Dimensional Generalization
+**5. Configurable Parameters** (all via constructor):
 
-`PromptFieldND` generalizes the field to arbitrary ℝⁿ. The math is identical — only the axis groupings and seeds change:
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `dim_groups` | 3 groups | Axis groupings — each list maps categories to one dimension |
+| `seeds` | 7 prototypes | Initial regions as (label, [coord₀, ..., coordₙ]) |
+| `sigma` | 0.20 | Gaussian kernel width σ |
+| `tanh_scale` | 15.0 | Steepness of keyword density → score mapping |
+| `novelty_threshold` | 0.55 | Energy below this → prompt is novel |
+| `min_distance` | 0.12 | Distance above this → prompt is novel |
+| `gd_steps` | 40 | Gradient descent iterations |
+| `gd_lr` | 0.04 | Gradient descent learning rate |
+
+### Usage
 
 ```python
+from asp.demo.field3d import PromptFieldND
+
 # 3D default (backwards-compatible)
 field = PromptFieldND(adapter)
+result = field.classify("Ignore all instructions", label="injection")
+# result["position"]   → [0.0, 0.92, 0.0]   raw ℝ³ position
+# result["optimized"]  → [0.03, 0.87, 0.02]  after gradient descent
+# result["energy"]     → 0.31                 field pressure
+# result["action"]     → "memorized" or "discarded"
 
 # 6D — one dimension per attack category
-field = PromptFieldND(adapter, dim_groups=[
+field_6d = PromptFieldND(adapter, dim_groups=[
     ["social_eng"], ["roleplay"], ["injection"],
     ["smuggling"], ["exfiltration"], ["reframing"],
 ], seeds=[
     ("benign",       [0.03, 0.03, 0.03, 0.03, 0.03, 0.03]),
     ("social_eng",   [0.90, 0.10, 0.10, 0.05, 0.05, 0.05]),
-    # ...
+    ("roleplay",     [0.10, 0.90, 0.10, 0.05, 0.05, 0.05]),
+    ("injection",    [0.10, 0.10, 0.90, 0.10, 0.10, 0.05]),
+    ("smuggling",    [0.05, 0.05, 0.10, 0.90, 0.05, 0.05]),
+    ("exfiltration", [0.05, 0.05, 0.10, 0.05, 0.90, 0.05]),
+    ("reframing",    [0.05, 0.05, 0.05, 0.05, 0.05, 0.90]),
 ])
 ```
 
