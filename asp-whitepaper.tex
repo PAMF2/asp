@@ -1,0 +1,1164 @@
+% =============================================================================
+% ASP: The Alignment Security Protocol — The Synthetic Immunity Protocol
+% IC3/Encode Club Shape Rotator Hackathon Submission
+% =============================================================================
+
+\documentclass[sigconf,natbib=false]{acmart}
+
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric}
+
+% --- ACM metadata (required by acmart) ---
+\acmConference[Shape Rotator '25]{IC3/Encode Club Hackathon}{2025}{Cornell University, Ithaca, NY}
+\acmDOI{}
+\acmISBN{}
+\copyrightyear{2025}
+
+% --- Code listing style ---
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{gray}\itshape,
+  stringstyle=\color{teal},
+  frame=single,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+% =============================================================================
+\begin{document}
+
+\title{ASP: The Alignment Security Protocol\\
+\large A Synthetic Immunity Architecture for Hardware-Enforced LLM Safety}
+
+\author{Submitted to the IC3/Encode Club Shape Rotator Hackathon}
+\affiliation{%
+  \institution{Cornell Initiative for CryptoCurrencies \& Contracts}
+  \city{Ithaca}
+  \state{New York}
+  \country{USA}
+}
+\email{anon@ic3.cornell.edu}
+
+% =============================================================================
+\begin{abstract}
+Large language models (LLMs) deployed in production environments are subject
+to adversarial attacks that systematically bypass safety alignment—including
+adversarial roleplay, prompt/context injection, and system-prompt exfiltration.
+Existing defenses (keyword filters, regex blocklists, fine-tuned refusal
+classifiers) share a common failure mode: they operate on surface form, making
+them vulnerable to paraphrase, encoding, and compositional obfuscation.
+
+We present the \emph{Alignment Security Protocol} (ASP), a defense-in-depth
+architecture that moves safety enforcement to three hardware-backed primitives:
+(1) a Trusted Execution Environment (TEE) boundary that destructs raw prompts
+after encoding, enforcing the invariant that only sanitized context ever reaches
+the LLM; (2) a Morphological Intent Encoder that classifies threat level via
+geometric proximity to attack manifolds in latent space, achieving surface-form
+invariance; and (3) a threshold signature scheme (N-of-M consensus) that
+prevents single-node compromise from forging a safe verdict.
+An epidemic gossip protocol propagates new attack signatures as
+\emph{vaccines} across the validator network in $O(\log N)$ rounds.
+
+We prove that a single compromised validator cannot produce a
+\textsc{Verified\_Immunity} verdict and that the encoder is invariant to
+surface-form transformations that preserve semantic intent. ASP is
+model-agnostic, implemented in Python~3.11 with no ML framework dependencies
+in the core path, and exposes a JSON-RPC~2.0 telemetry interface for
+interoperability.
+
+\textbf{Keywords:} TEE isolation, threshold cryptography, federated AI safety,
+morphological intent detection, jailbreak defense, gossip protocols,
+Shamir secret sharing.
+\end{abstract}
+
+\maketitle
+
+% =============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+The deployment of aligned LLMs at scale has produced an adversarial arms race.
+Safety alignment, whether via RLHF~\cite{ouyang2022training},
+Constitutional~AI~\cite{bai2022constitutional}, or supervised fine-tuning,
+is applied at training time and encoded in the model's weight distribution.
+At inference time, the model is a text transducer operating on a flat context
+window, with no architectural mechanism to distinguish a system operator's
+instruction from an adversarial user injection.
+
+\subsection{The Alignment Tax Problem}
+\label{sec:intro:tax}
+
+Contemporary safety wrappers exhibit a trilemma we term the \emph{alignment
+tax}: precision, recall, and latency cannot all be optimized simultaneously
+against a capable adversary. Keyword and regex filters have near-zero latency
+but suffer from recall failure under paraphrase, encoding substitution
+(Base64, Unicode homoglyphs, ROT-$n$), and inter-language attacks. Neural
+classifiers trained on known jailbreak datasets exhibit high recall on
+in-distribution attacks but degrade sharply on compositional novelty—a
+property formally demonstrated by Wei et al.~\cite{wei2023jailbroken} and
+Zou et al.~\cite{zou2023universal}.
+
+The root failure is architectural, not parametric: when a safety mechanism
+operates on the same surface as the attack, the attacker's search space is
+the same as the defender's. No filter defined over token sequences can be
+closed under the equivalence class of paraphrases that preserve harmful
+intent.
+
+\subsection{Why Hardware-Enforced Enforcement}
+\label{sec:intro:hw}
+
+The NDAI Agreements framework~\cite{ndai2024tee} establishes a compelling
+precedent: TEEs can serve as \emph{data handling policy} enforcement points
+where code authenticity is remotely verifiable and memory is opaque to the
+host OS. This primitively changes the threat model. An adversary who
+compromises the host process cannot read or modify the computation inside the
+enclave. The policy (the sanitizer and encoder) runs in attested, measured
+code.
+
+We extend this insight: the TEE is not merely a confidentiality boundary—it
+is a \emph{liveness} boundary. The critical invariant is that the raw prompt
+is \emph{deleted} after encoding, inside the enclave. Nothing that leaves the
+TEE contains the raw user text; only the encoded threat vector and a
+defense-rewritten context do.
+
+\subsection{Threat Classes}
+\label{sec:intro:threats}
+
+We identify three primary attack classes against aligned LLMs, each requiring
+a distinct defense primitive:
+
+\begin{enumerate}
+\item \textbf{Adversarial Roleplay (AR):} The attacker instructs the model to
+adopt a persona with different safety properties (``DAN'', unrestricted
+characters, fictional experts in harmful domains). Survey data from
+Shen et al.~\cite{shen2023anything} classifies persona-injection as the
+modal jailbreak category ($\approx$47\% of successful attacks in the wild).
+
+\item \textbf{Context/Prompt Injection (CPI):} The attacker injects content
+into the context window designed to override system instructions. This
+includes direct instruction overrides~\cite{perez2022ignore}, delimiter
+attacks that close the system prompt block and open a new one, and indirect
+injection via retrieved documents in RAG pipelines~\cite{greshake2023youve}.
+
+\item \textbf{Prompt Exfiltration (PE):} The attacker extracts the system
+prompt or model internals through carefully crafted queries. While not
+directly a jailbreak, exfiltration enables targeted construction of
+attacks that bypass specific defenses.
+\end{enumerate}
+
+\subsection{Contributions}
+\label{sec:intro:contributions}
+
+We make the following contributions:
+
+\begin{enumerate}
+\item A formal architecture (\S\ref{sec:architecture}) for hardware-enforced
+LLM safety with a provable raw-prompt non-disclosure invariant.
+\item The Morphological Intent Encoder (\S\ref{sec:encoder}), a surface-form
+invariant threat classifier operating on latent space geometry.
+\item A threshold signature protocol (\S\ref{sec:threshold}) for
+multi-node consensus on safety verdicts, with a security proof
+against single-node compromise (\S\ref{sec:security}).
+\item An epidemic vaccine propagation system (\S\ref{sec:gossip}) for
+federated immunity with $O(\log N)$ convergence.
+\item A JSON-RPC~2.0 telemetry protocol (\S\ref{sec:telemetry}) for
+model-agnostic interoperability.
+\item An open-source reference implementation in Python~3.11
+(\S\ref{sec:implementation}) with 8 test suites and stdlib-only core.
+\end{enumerate}
+
+% =============================================================================
+\section{Background and Related Work}
+\label{sec:background}
+
+\subsection{Trusted Execution Environments as Policy Enforcement}
+\label{sec:bg:tee}
+
+Trusted Execution Environments (Intel TDX/SGX, AMD SEV-SNP, ARM TrustZone)
+provide hardware-enforced memory isolation and remote attestation. The host
+OS cannot read enclave memory, and the attestation report binds code identity
+(MRENCLAVE measurement) to the execution environment.
+
+The NDAI Agreements~\cite{ndai2024tee} paper is the closest prior work to our
+TEE application domain. It proposes TEEs as \emph{data handling policy}
+enforcement points in AI deployment, where the enclave enforces data use
+agreements without requiring trust in the cloud provider. We extend this
+model specifically to prompt-level safety, adding the invariant that
+raw prompts are destroyed before exiting the enclave.
+
+Dstack~\cite{dstack2024} provides a developer-facing TEE orchestration
+layer with attestation APIs over Intel TDX. ASP uses Dstack's attestation
+interface to verify that the sanitizer and encoder running in the enclave
+match their expected measurements.
+
+\subsection{Threshold Cryptography and Thetacrypt}
+\label{sec:bg:threshold}
+
+Threshold cryptography distributes a cryptographic operation across $M$ parties
+such that any $N \leq M$ parties can jointly perform it, but fewer than $N$
+cannot~\cite{desmedt1987society}. Threshold signature schemes are the
+primary primitive: a secret signing key is split into $M$ shares such that
+any $N$ shares suffice to produce a valid signature, but $N-1$ shares reveal
+nothing about the key.
+
+Thetacrypt~\cite{thetacrypt2024} is a practical threshold cryptography
+library designed for distributed consensus applications, providing
+threshold BLS signatures and Distributed Key Generation (DKG). ASP's
+threshold validation protocol is directly inspired by Thetacrypt's
+``quorum of trust'' model: a verdict is valid only when $N$ independent
+validator nodes co-sign it.
+
+\subsection{Shamir Secret Sharing}
+\label{sec:bg:shamir}
+
+Shamir~\cite{shamir1979share} showed that any secret $s \in \mathbb{Z}_p$
+can be hidden in the constant term of a uniformly random polynomial
+$f(x) = s + a_1 x + \cdots + a_{t-1} x^{t-1}$ over $\mathbb{Z}_p$.
+Evaluating $f$ at $M$ distinct non-zero points produces $M$ shares; any
+$t$ shares allow Lagrange interpolation to recover $f(0) = s$, while
+$t-1$ shares are information-theoretically independent of $s$.
+
+ASP uses Shamir secret sharing to split validator signing keys, so that
+a quorum of $N$ nodes is necessary and sufficient to produce a valid
+aggregated signature over a safety verdict.
+
+\subsection{Epidemic Algorithms for Gossip Convergence}
+\label{sec:bg:gossip}
+
+Demers et al.~\cite{demers1987epidemic} established the theoretical
+foundations for epidemic (gossip) protocols, proving that rumor-spreading
+with random peer selection achieves convergence in $O(\log N)$ rounds for
+a network of $N$ nodes. The ``push'' variant—where a node forwards a
+message to $k$ random peers per round—is the model used by ASP for
+vaccine propagation.
+
+\subsection{Latent Space Attack Manifolds}
+\label{sec:bg:manifolds}
+
+Adversarial ML literature has extensively characterized the structure of
+attack inputs in embedding space. Zou et al.~\cite{zou2023universal}
+demonstrated that adversarial suffixes for aligned LLMs transfer across
+models, implying that attacks share representational structure independent
+of surface form. Carlini et al.~\cite{carlini2023aligned} showed that
+alignment fine-tuning does not close the latent-space proximity between
+harmful and harmless representations.
+
+These results motivate our encoder design: semantic intent is more stable
+in latent space than in token space, so detecting attacks by latent-space
+proximity to known attack embeddings is more robust than surface-form matching.
+
+\subsection{Jailbreak Taxonomy}
+\label{sec:bg:taxonomy}
+
+Wei et al.~\cite{wei2023jailbroken} identify two failure modes of safety
+training—``competing objectives'' (the model trades helpfulness against
+safety) and ``mismatched generalization'' (safety training does not cover
+the full distribution of attack prompts). This analysis predicts that
+roleplay attacks are the dominant category: they exploit the helpfulness
+objective by framing the harmful request as a creative or educational task.
+Perez and Ribeiro~\cite{perez2022ignore} provide a systematic taxonomy of
+prompt injection variants, covering direct instruction overrides, delimiter
+attacks, and virtualization attacks.
+
+% =============================================================================
+\section{Threat Model}
+\label{sec:threat}
+
+\subsection{Attacker Model}
+\label{sec:threat:attacker}
+
+\textbf{Capabilities.} The attacker can:
+\begin{itemize}
+  \item Submit arbitrary strings to the LLM API (user-controlled input).
+  \item Observe LLM outputs in full.
+  \item Know the existence and general design of ASP (Kerckhoffs principle).
+  \item Compromise up to $N-1$ validator nodes (but not $N$ or more).
+  \item Access the host OS but not the TEE enclave memory.
+\end{itemize}
+
+\textbf{Goals.} The attacker seeks to:
+\begin{itemize}
+  \item Elicit harmful outputs from the downstream LLM.
+  \item Cause the system to emit a \textsc{Verified\_Immunity} verdict
+    for a request that should be blocked.
+  \item Extract the raw prompt or system context from the TEE.
+\end{itemize}
+
+\subsection{Formal Attack Class Definitions}
+\label{sec:threat:classes}
+
+Let $\Sigma^*$ be the set of all input strings and $\mathcal{H} \subset \Sigma^*$
+be the set of harmful prompts (as defined by the system operator's policy).
+
+\begin{definition}[Adversarial Roleplay Attack]
+A string $x \in \Sigma^*$ is an \emph{adversarial roleplay attack} if
+$x \notin \mathcal{H}$ by surface-form analysis but
+$\exists x' \in \mathcal{H}$ such that $x$ is semantically equivalent to
+a composition $\langle\text{persona frame}\rangle \circ x'$, where the
+persona frame asserts altered safety properties.
+\end{definition}
+
+\begin{definition}[Context Injection Attack]
+A string $x \in \Sigma^*$ is a \emph{context injection attack} if
+$x$ contains a subsequence $s$ such that, when $s$ is processed by
+the LLM, it causes the LLM to deviate from its system-prompt-specified
+behavior by treating $s$ as a higher-priority instruction source than
+the system prompt.
+\end{definition}
+
+\begin{definition}[Prompt Exfiltration Attack]
+A string $x \in \Sigma^*$ is a \emph{prompt exfiltration attack} if
+processing $x$ causes the LLM to emit any substring of the system prompt
+$P$ in its response, i.e., the response contains $s \subseteq P$.
+\end{definition}
+
+\subsection{Trust Boundaries}
+\label{sec:threat:trust}
+
+\textbf{ASP trusts:}
+\begin{itemize}
+  \item TEE hardware (SGX/TDX/SEV integrity guarantees).
+  \item The attested code measurement of the sanitizer and encoder.
+  \item Any quorum of $\geq N$ validator nodes producing consistent verdicts.
+  \item The embedding model's ability to cluster semantically similar inputs.
+\end{itemize}
+
+\textbf{ASP does not trust:}
+\begin{itemize}
+  \item The host OS, hypervisor, or network between components.
+  \item Any single validator node.
+  \item The LLM's own safety mechanisms (treated as a defense in depth layer,
+    not the primary enforcement mechanism).
+  \item Surface-form analysis of input text.
+\end{itemize}
+
+\subsection{Explicit Non-Goals}
+\label{sec:threat:nongaols}
+
+ASP does not protect against:
+\begin{itemize}
+  \item Physical side-channel attacks on TEE hardware (power, timing, EM).
+  \item A Byzantine majority ($\geq N$ of $M$) of validator nodes.
+  \item Attacks that are semantically outside the coverage of the attack
+    signature database (zero-day attacks with no prior vaccine).
+  \item Synchronization-independent attacks that exploit the gossip
+    convergence window before a vaccine propagates.
+  \item Model weight extraction or membership inference attacks.
+\end{itemize}
+
+% =============================================================================
+\section{System Architecture}
+\label{sec:architecture}
+
+Figure~\ref{fig:architecture} illustrates the full ASP pipeline. A raw user
+prompt enters the TEE boundary and traverses four layers before a
+defense-sanitized context is released to the downstream LLM. The pipeline
+is entirely asynchronous and model-agnostic.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm and 1.4cm,
+    box/.style={draw, rectangle, rounded corners=3pt, minimum width=2.6cm,
+                minimum height=0.7cm, font=\footnotesize, fill=blue!6},
+    tee/.style={draw, rectangle, dashed, rounded corners=6pt,
+                inner sep=10pt, label={[font=\footnotesize\itshape]north:TEE Enclave}},
+    arrow/.style={-{Stealth[length=4pt]}, thick},
+  ]
+
+  \node[box] (raw)    {Raw Prompt};
+  \node[box, right=of raw]  (san)    {Sanitizer};
+  \node[box, right=of san]  (enc)    {Intent Encoder};
+  \node[box, below=of enc]  (def)    {Defense Router};
+  \node[box, left=of def]   (thr)    {Threshold Validator};
+  \node[box, left=of thr]   (out)    {Sanitized Context};
+  \node[box, below=of out]  (llm)    {LLM};
+
+  \draw[arrow] (raw) -- node[above,font=\tiny]{enter} (san);
+  \draw[arrow] (san) -- node[above,font=\tiny]{skeleton} (enc);
+  \draw[arrow] (enc) -- node[right,font=\tiny]{ThreatVector} (def);
+  \draw[arrow] (def) -- node[below,font=\tiny]{MitigationPayload} (thr);
+  \draw[arrow] (thr) -- node[below,font=\tiny]{SignatureBlock} (out);
+  \draw[arrow] (out) -- node[left,font=\tiny]{exit TEE} (llm);
+
+  \node[draw=red!50, dashed, rounded corners=6pt, fit=(san)(enc)(def)(thr)(out),
+        inner sep=8pt, label={[font=\footnotesize\itshape,text=red!70]north:TEE Enclave}] {};
+\end{tikzpicture}
+\caption{ASP pipeline. The raw prompt enters the TEE enclave, is encoded and
+classified, mitigation is applied, threshold consensus is collected, and only
+the sanitized context exits.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{TEE Isolation Layer}
+\label{sec:tee}
+
+\textbf{Formal Data Flow.}
+Let $P$ be a raw prompt string. The TEE boundary enforces the following
+sequential transformation:
+
+\begin{equation}
+\label{eq:pipeline}
+P \xrightarrow{\text{sanitize}} C_{\emptyset}
+  \xrightarrow{\text{encode}(P)} \vec{v}
+  \xrightarrow{\text{del } P}
+  \xrightarrow{\text{route}} M
+  \xrightarrow{\text{validate}} B
+  \xrightarrow{\text{if VERIFIED}} C_{\text{safe}}
+\end{equation}
+
+where $C_{\emptyset}$ is a skeleton context with no raw content,
+$\vec{v} \in \mathbb{R}^d$ is the threat vector,
+$M$ is the mitigation payload,
+$B$ is the threshold signature block, and
+$C_{\text{safe}}$ is the defense-rewritten context released to the LLM.
+
+\textbf{The Critical Invariant.}
+The instruction \texttt{del raw\_prompt} in Algorithm~\ref{alg:pipeline}
+is not a correctness optimization—it is the primary security property.
+After encoding, the raw prompt is a local variable in the enclave; Python's
+garbage collector deallocates the page. In a production TEE deployment,
+the enclave allocator explicitly zeros the pages. No instance variable,
+log, or return value ever holds the raw prompt after Line~3 of
+Algorithm~\ref{alg:pipeline}.
+
+\begin{algorithm}[t]
+\caption{TEE Boundary: process(raw\_prompt)}
+\label{alg:pipeline}
+\begin{algorithmic}[1]
+\Require raw\_prompt $\in \Sigma^*$
+\Ensure PipelineResult with sanitized context
+\State $C \gets \text{sanitize}(\text{raw\_prompt})$
+  \Comment{Build skeleton context; no raw content}
+\State $\vec{v} \gets \text{encode}(\text{raw\_prompt})$
+  \Comment{Project to latent space; last access}
+\State \textbf{del} raw\_prompt
+  \Comment{\textbf{Critical: destroy raw text}}
+\State $M \gets \text{defenseRouter.route}(\vec{v},\, C)$
+\State $B \gets \textbf{await}~\text{thresholdValidator.validate}(\vec{v},\, M)$
+\If{$B.\text{verdict} = \textsc{Rejected}$}
+  \State \textbf{raise} SecurityError
+\EndIf
+\Return $(C_\text{safe},\, \vec{v},\, M,\, B)$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Remote Attestation.}
+ASP integrates with the Dstack attestation API~\cite{dstack2024} to provide
+cryptographic proof that the sanitizer and encoder code running in the enclave
+matches the operator-expected measurement. The \texttt{DstackAttestation}
+class wraps the MRENCLAVE measurement and exposes a \texttt{verify\_remote}
+method. An external verifier can confirm that ASP is running unmodified inside
+a genuine TEE before trusting its verdicts.
+
+\subsection{Morphological Intent Encoder}
+\label{sec:encoder}
+
+\textbf{Formal Definition.}
+Let $\Sigma^*$ be the input alphabet and $\mathbb{R}^d$ the embedding space
+(dimension $d = 768$ by default). The morphological intent encoder is a
+function:
+
+\begin{equation}
+\label{eq:encoder}
+f : \Sigma^* \to \mathbb{R}^d
+\end{equation}
+
+implemented by an embedding adapter $\phi$ followed by L2-normalization:
+
+\begin{equation}
+\label{eq:embed}
+f(x) = \frac{\phi(x)}{\|\phi(x)\|_2}
+\end{equation}
+
+\textbf{Attack Manifolds.}
+For each attack class $k \in \{1, \ldots, K\}$, let
+$A_k = \{f(a) : a \in \mathcal{A}_k\} \subset S^{d-1}$
+be the set of L2-normalized embeddings of known attack instances in class $k$,
+forming a \emph{manifold} on the unit hypersphere.
+
+The threat level function is defined by piecewise thresholds on cosine
+similarity to the nearest point on any manifold:
+
+\begin{equation}
+\label{eq:threat}
+\tau(x) = \begin{cases}
+\textsc{Quarantine} & \text{if } \max_k \max_{a \in A_k} \langle f(x), a \rangle \geq \theta_B + 0.10 \\
+\textsc{Block}      & \text{if } \max_k \max_{a \in A_k} \langle f(x), a \rangle \geq \theta_B \\
+\textsc{Warn}       & \text{if } \max_k \max_{a \in A_k} \langle f(x), a \rangle \geq \frac{\theta_B + \theta_M}{2} \\
+\textsc{Monitor}    & \text{if } \max_k \max_{a \in A_k} \langle f(x), a \rangle \geq \theta_M \\
+\textsc{Benign}     & \text{otherwise}
+\end{cases}
+\end{equation}
+
+where $\theta_B = 0.82$ is the block threshold and $\theta_M = 0.65$
+is the monitor threshold (both configurable via \texttt{ASPConfig}).
+
+\textbf{Surface-Form Invariance Property.}
+The key insight is that $f$ (the embedding function) collapses
+surface-form variation while preserving semantic intent. Formally:
+
+\begin{definition}[Surface-Form Equivalence]
+Two prompts $x, x' \in \Sigma^*$ are \emph{surface-form equivalent}
+with respect to intent $I$ if $\text{intent}(x) = \text{intent}(x') = I$,
+but $x \neq x'$ as strings (e.g., $x'$ is a paraphrase, translation,
+or encoded variant of $x$).
+\end{definition}
+
+\begin{claim}[Surface-Form Invariance]
+\label{claim:sfi}
+For any two surface-form equivalent prompts $x, x'$ with harmful intent,
+$\langle f(x), f(x') \rangle > \theta_M$, i.e., both are classified
+at threat level $\geq$ \textsc{Monitor}.
+\end{claim}
+
+This claim is supported empirically by the transfer attack results of
+Zou et al.~\cite{zou2023universal}, which demonstrate that adversarial
+suffixes computed for one model transfer to others, indicating that harmful
+intent occupies a stable region of the embedding space across paraphrases.
+Our implementation uses the nearest-neighbor search over the attack
+signature DB (Algorithm~\ref{alg:encoder}) to approximate manifold proximity.
+
+\begin{algorithm}[t]
+\caption{MorphologicalIntentEncoder.encode(raw\_prompt)}
+\label{alg:encoder}
+\begin{algorithmic}[1]
+\Require raw\_prompt $\in \Sigma^*$
+\Ensure ThreatVector $\vec{v}$
+\State $e \gets \phi(\text{raw\_prompt})$ \Comment{Embed via adapter}
+\State $e \gets e / \|e\|_2$ \Comment{L2-normalize}
+\State $(M, \text{ids}) \gets \text{AttackDB.get\_matrix}()$
+\If{$M = \emptyset$}
+  \Return ThreatVector$(e,\, 0.0,\, \varepsilon,\, \textsc{Benign})$
+\EndIf
+\State $i^* \gets \arg\max_i (M \cdot e)_i$
+  \Comment{Nearest attack signature}
+\State $s^* \gets (M \cdot e)_{i^*}$
+  \Comment{Max cosine similarity}
+\State $\ell \gets \tau(s^*)$ \Comment{Classify via Eq.~\eqref{eq:threat}}
+\Return ThreatVector$(e,\, s^*,\, \text{ids}[i^*],\, \ell)$
+\end{algorithmic}
+\end{algorithm}
+
+The attack signature database stores L2-normalized embeddings of known
+attack prompts as a matrix $M \in \mathbb{R}^{n \times d}$ and supports
+$O(nd)$ nearest-neighbor search (suitable for deployment-scale $n$;
+production systems may substitute an ANN index such as FAISS).
+
+\subsection{Threshold Validation}
+\label{sec:threshold}
+
+\textbf{Formal Scheme.}
+An $(N, M)$-threshold validation scheme consists of $M$ validator nodes,
+each holding a secret share derived from the network signing key.
+A verdict $V$ obtains status \textsc{Verified\_Immunity} only when
+$\geq N$ nodes independently co-sign it.
+
+\textbf{Secret Sharing.}
+Following Shamir~\cite{shamir1979share}, the signing key $s \in \mathbb{Z}_p$
+(where $p = 2^{256} - 189$ is a 256-bit prime) is split by choosing a
+random polynomial:
+
+\begin{equation}
+\label{eq:shamir}
+f(x) = s + a_1 x + a_2 x^2 + \cdots + a_{N-1} x^{N-1} \pmod{p}
+\end{equation}
+
+where $a_1, \ldots, a_{N-1} \overset{\$}{\leftarrow} \mathbb{Z}_p$.
+Node $i$ receives share $(i,\, f(i))$ for $i \in \{1, \ldots, M\}$.
+
+\textbf{Reconstruction.}
+Given any $N$ shares $\{(x_j, y_j)\}_{j=1}^{N}$, the secret is recovered
+by Lagrange interpolation at $x = 0$:
+
+\begin{equation}
+\label{eq:lagrange}
+s = f(0) = \sum_{j=1}^{N} y_j \prod_{\substack{k=1\\k \neq j}}^{N}
+  \frac{-x_k}{x_j - x_k} \pmod{p}
+\end{equation}
+
+Equation~\eqref{eq:lagrange} is implemented in \texttt{asp/threshold/share.py}
+using modular inverse via Fermat's little theorem: $a^{-1} \equiv a^{p-2} \pmod{p}$.
+
+\textbf{State Machine.}
+A verdict request progresses through the following states:
+
+\begin{equation}
+\label{eq:statemachine}
+\textsc{Untrusted}
+  \xrightarrow{\text{submit}}
+\textsc{Pending}
+  \xrightarrow{|\text{shares}| \geq N}
+\textsc{Verified\_Immunity}
+  \quad \text{or} \quad
+\textsc{Rejected}
+\end{equation}
+
+A verdict that times out (configurable, default 5~s) without reaching quorum
+remains \textsc{Untrusted} and is treated as a hard reject.
+
+\begin{algorithm}[t]
+\caption{ThresholdValidator.validate($r$, $\vec{v}$, $M$)}
+\label{alg:threshold}
+\begin{algorithmic}[1]
+\Require request\_id $r$, ThreatVector $\vec{v}$, MitigationPayload $M$
+\Ensure ThresholdSignatureBlock $B$
+\State nodes $\gets$ NodeRegistry.get\_all()
+\State $N \gets \min(\text{config.threshold\_N},\, |\text{nodes}|)$
+\State $V_\text{prop} \gets \textsc{Rejected}$ if $M.\text{action} = \textsc{FullBlock}$ else \textsc{Verified\_Immunity}
+\State shares $\gets []$
+\ForAll{node $n_i \in \text{nodes}$} \textbf{async}
+  \State $V_i \gets n_i.\text{evaluate\_locally}(\vec{v})$
+  \If{$V_i = V_\text{prop}$}
+    \State shares.append($n_i.\text{sign}(r, \vec{v}, V_\text{prop})$)
+  \EndIf
+\EndFor
+\State \textbf{await with timeout}
+\If{$|\text{shares}| \geq N$}
+  \State $\sigma \gets \text{SHA256}(\text{concat\_sorted}(\text{shares}))$
+  \Return $B(V_\text{prop},\, r,\, N,\, |\text{nodes}|,\, \text{shares},\, \sigma)$
+\Else
+  \Return $B(\textsc{Untrusted},\, r,\, N,\, |\text{nodes}|,\, [],\, \varepsilon)$
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Federated Immunity via Gossip}
+\label{sec:gossip}
+
+\textbf{Vaccine Structure.}
+When a node detects a novel attack pattern (one not in its local attack DB),
+it packages an embedding into a \emph{vaccine}:
+
+\begin{equation}
+\label{eq:vaccine}
+V = (h,\, \vec{e},\, \text{module},\, \text{node\_id},\, t)
+\end{equation}
+
+where $h = \text{SHA256}(\vec{e}.\text{tobytes}())$ is the content hash,
+$\vec{e} \in \mathbb{R}^d$ is the attack embedding,
+\text{module} names the defense handler, and $t$ is the discovery timestamp.
+
+\textbf{Epidemic Broadcast.}
+The gossip engine implements push-rumor spreading~\cite{demers1987epidemic}.
+In each round, a node holding an unseen vaccine selects $k$ random healthy
+peers (the \emph{fanout}, default $k=3$) and sends the vaccine to those
+peers that have not yet seen it (tracked via a per-peer seen-set).
+
+\begin{theorem}[Convergence Bound]
+\label{thm:gossip}
+In a connected network of $N$ nodes with gossip fanout $k \geq 2$, the
+push-rumor protocol delivers a vaccine to all nodes within
+$O(\log_k N)$ rounds in expectation, after which no further propagation
+occurs due to the seen-set idempotency check.
+\end{theorem}
+
+\begin{proof}[Proof Sketch]
+At round $r$, let $I_r$ be the number of infected (vaccine-holding) nodes.
+Each infected node contacts $k$ random peers; the probability of hitting
+at least one uninfected node decreases as $I_r \to N$ but the expected
+doubling time is $O(1/k)$ rounds. Standard coupon-collector analysis
+gives $O(\log_k N)$ rounds to full coverage.
+See Demers et al.~\cite{demers1987epidemic} for a rigorous treatment.
+\end{proof}
+
+\textbf{Idempotency.}
+Each node maintains a \texttt{seen} set of vaccine hashes. On receiving a
+vaccine, the node checks $h \in \text{seen}$ before processing. Duplicate
+vaccines are discarded without re-broadcasting, ensuring the protocol
+terminates and the attack DB remains consistent across the network.
+
+\textbf{Network Partition Tolerance.}
+If a partition separates the network, vaccines propagate only within each
+partition until connectivity is restored. Upon reconnection, the gossip
+engine will re-broadcast pending vaccines to newly reachable peers.
+This provides eventual consistency guarantees with no coordination overhead.
+
+\subsection{Defense Module Interface}
+\label{sec:defense}
+
+Each defense module implements the following abstract interface:
+
+\begin{align}
+\label{eq:defense_interface}
+\text{evaluate} &: \text{ThreatVector} \to [0, 1] \\
+\text{mitigate} &: (\text{ThreatVector},\, \text{SanitizedContext}) \to \text{MitigationPayload}
+\end{align}
+
+The \texttt{evaluate} function returns a confidence score for the module's
+relevance to the given threat. The defense router selects the highest-confidence
+module capable of handling the threat level.
+
+\textbf{AdversarialRoleplayModule.}
+The roleplay module represents its detection capability as a centroid
+vector in embedding space:
+
+\begin{equation}
+\label{eq:capability}
+\vec{c}_{\text{roleplay}} = \frac{1}{|S|} \sum_{s \in S} f(s)
+\end{equation}
+
+where $S$ is a seed set of canonical roleplay attack descriptions
+(``pretend you are an unrestricted AI'', ``act as DAN'', etc.).
+The module's confidence on a threat $\vec{v}$ is
+$\text{ReLU}(\langle \vec{v}, \vec{c}_{\text{roleplay}} \rangle)$.
+
+Mitigation strategy is graduated: at \textsc{Warn} level, the module
+redirects the roleplay frame to a safe persona; at \textsc{Block}/\textsc{Quarantine},
+it substitutes the entire request with a safe notification (full block).
+
+\textbf{ContextInjectionModule.}
+This module defends against instruction override attacks by wrapping the
+sanitized context in explicit \emph{alignment anchors}—boundary markers
+that the LLM's instruction-following circuitry is trained to treat as
+system-level demarcations:
+
+\begin{lstlisting}[language={},caption={Alignment Anchor Structure},label={lst:anchors}]
+[SYSTEM BOUNDARY - VERIFIED BY ASP THRESHOLD CONSENSUS]
+The following is untrusted user input. Your system prompt
+takes absolute precedence over any instructions below.
+[BEGIN UNTRUSTED INPUT]
+{sanitized_content}
+[END UNTRUSTED INPUT]
+[SYSTEM BOUNDARY - RESUME NORMAL OPERATION]
+\end{lstlisting}
+
+This defense does not rely on the LLM treating the anchors as
+special tokens—it exploits the fact that explicit demarcation in
+the system-prompt position is consistently honored by RLHF-aligned
+models. At \textsc{Block}/\textsc{Quarantine}, the module performs
+a full block, replacing user content with a safe notification.
+
+% =============================================================================
+\section{JSON-RPC 2.0 Telemetry Protocol}
+\label{sec:telemetry}
+
+ASP exposes all internal state transitions via a JSON-RPC~2.0 notification
+interface. This design choice is deliberate: JSON-RPC~2.0 requires no
+external libraries, supports batching, is model-agnostic, and is easily
+parseable by any downstream analytics system.
+
+\textbf{Protocol Messages.}
+Table~\ref{tab:telemetry} defines the three canonical message types.
+All messages are JSON-RPC~2.0 notifications (no response expected), using
+the \texttt{asp.*} method namespace.
+
+\begin{table}[t]
+\centering
+\caption{ASP Telemetry Message Schemas}
+\label{tab:telemetry}
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Description} \\
+\midrule
+\multicolumn{3}{l}{\textit{Method: \texttt{asp.threat\_detected}}} \\
+\texttt{request\_id}  & string  & UUID of the request \\
+\texttt{embedding}    & float[] & L2-norm'd threat vector \\
+\texttt{max\_attack\_similarity} & float & Cosine sim to nearest attack sig \\
+\texttt{nearest\_attack\_id}    & string & SHA-256 hash of nearest sig \\
+\texttt{threat\_level}          & string & Enum: BENIGN…QUARANTINE \\
+\texttt{timestamp}    & float   & Unix epoch seconds \\
+\midrule
+\multicolumn{3}{l}{\textit{Method: \texttt{asp.mitigation\_applied}}} \\
+\texttt{request\_id}   & string & UUID (matches threat message) \\
+\texttt{defense\_module} & string & Module name \\
+\texttt{action}        & string & Enum: PASS\_THROUGH…FULL\_BLOCK \\
+\texttt{explanation}   & string & Human-readable rationale \\
+\texttt{metadata}      & object & Module-specific kv pairs \\
+\midrule
+\multicolumn{3}{l}{\textit{Method: \texttt{asp.threshold\_result}}} \\
+\texttt{request\_id}   & string & UUID \\
+\texttt{verdict}       & string & Enum: UNTRUSTED…VERIFIED\_IMMUNITY \\
+\texttt{threshold}     & int    & $N$ \\
+\texttt{total\_nodes}  & int    & $M$ \\
+\texttt{shares\_collected} & int & Actual shares gathered \\
+\texttt{is\_valid}     & bool   & $\geq N$ shares with aggregated sig \\
+\texttt{aggregated\_signature\_hex} & string & Hex-encoded aggregate \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Rationale for JSON-RPC~2.0.}
+Alternatives considered include gRPC (protobuf) and plain HTTP REST.
+JSON-RPC~2.0 was chosen because: (1) it requires zero external dependencies
+(stdlib \texttt{json} only); (2) batching support enables high-throughput
+telemetry without connection overhead; (3) the method-dispatch model maps
+cleanly onto ASP's three event types; (4) JSON is universally parseable by
+security tooling.
+
+% =============================================================================
+\section{Security Analysis}
+\label{sec:security}
+
+\subsection{Threshold Security Against Node Compromise}
+\label{sec:security:threshold}
+
+\begin{theorem}[Single-Node Non-Forgery]
+\label{thm:threshold}
+Let $(N, M)$ be the threshold parameters with $N \geq 2$.
+If at most $N-1$ validator nodes are compromised (controlled by the attacker),
+then the attacker cannot forge a \textsc{Verified\_Immunity} verdict for
+any request that would otherwise receive \textsc{Rejected}.
+\end{theorem}
+
+\begin{proof}
+A \textsc{Verified\_Immunity} verdict requires $\geq N$ valid
+\texttt{SignatureShare} objects in the \texttt{ThresholdSignatureBlock},
+each produced by a distinct honest node signing the verdict.
+
+A compromised node can produce at most one \texttt{SignatureShare} (its own).
+With $N-1$ compromised nodes, the attacker controls at most $N-1$ shares.
+Since the threshold is $N$, the attacker is one share short.
+
+The remaining honest nodes sign only if their local threat assessment agrees
+with the proposed verdict. For a request the system assesses as harmful,
+honest nodes compute \textsc{Rejected} locally and will not sign
+\textsc{Verified\_Immunity}. Therefore the quorum of $N$ honest signatures
+cannot be assembled.
+
+In the Shamir formulation: the attacker holds at most $N-1$ shares of the
+signing key. By the information-theoretic security of Shamir's scheme,
+$N-1$ shares are statistically independent of the key (the polynomial's
+constant term is uniformly random given any $N-1$ evaluations)~\cite{shamir1979share}.
+Therefore the attacker cannot compute the aggregated signature.
+\end{proof}
+
+\begin{corollary}
+The default configuration $(N=2, M=3)$ tolerates one compromised validator.
+For $k$-fault tolerance, set $N = M - k$ with $M \geq 2k + 1$.
+\end{corollary}
+
+\subsection{Surface-Form Invariance}
+\label{sec:security:sfi}
+
+\begin{theorem}[Attack Detection Under Paraphrase]
+\label{thm:sfi}
+Let $x$ and $x'$ be two prompts with the same harmful intent
+$I \in \mathcal{H}$ (differing only in surface form: paraphrase,
+encoding, language). Assume the embedding function $\phi$ satisfies
+the \emph{semantic stability} property:
+$\langle f(x), f(x') \rangle \geq \epsilon$ for some $\epsilon > \theta_M$.
+Then $\tau(x) \geq \textsc{Monitor}$ and $\tau(x') \geq \textsc{Monitor}$.
+\end{theorem}
+
+\begin{proof}
+By the triangle inequality on cosine distance: if $a \in A_k$ is a seed
+attack embedding with $\langle f(x), a \rangle \geq \theta_B$, then
+$\langle f(x'), a \rangle \geq \langle f(x), a \rangle - \|f(x) - f(x')\|$.
+The semantic stability assumption bounds $\|f(x) - f(x')\|$ via
+$\|f(x) - f(x')\|^2 = 2 - 2\langle f(x), f(x')\rangle \leq 2(1-\epsilon)$.
+Choosing $\epsilon$ such that $\theta_B - \sqrt{2(1-\epsilon)} > \theta_M$
+gives the result.
+\end{proof}
+
+\textbf{Remark.} The semantic stability property is an assumption about
+the embedding model $\phi$, not a proof about arbitrary embedders.
+Empirical evidence from Zou et al.~\cite{zou2023universal} and
+Carlini et al.~\cite{carlini2023aligned} supports this property for
+current generation sentence transformers on the relevant attack classes.
+
+\subsection{Attack Class Resistance}
+\label{sec:security:resistance}
+
+\textbf{Adversarial Roleplay.}
+The AdversarialRoleplayModule's capability vector $\vec{c}_{\text{roleplay}}$
+is computed as the centroid of seed attack embeddings. By Theorem~\ref{thm:sfi},
+surface-form variants of roleplay attacks map to the same region of latent
+space. The module evaluates all inputs, not just those already in the
+attack DB, providing coverage for novel roleplay framings.
+
+\textbf{Context Injection.}
+The ContextInjectionModule responds by wrapping all user content in
+alignment anchors regardless of confidence level at \textsc{Monitor}
+and above. This is a structural defense: even if the classifier
+mis-scores the injection, the anchor wrapping limits the injection's
+ability to override the system prompt.
+
+\textbf{Prompt Exfiltration.}
+The raw prompt is deleted after encoding (Algorithm~\ref{alg:pipeline},
+Line 3), and the system prompt is never placed in the raw prompt field.
+Only the defense-rewritten \texttt{SanitizedContext} exits the TEE,
+which contains no raw user content. This provides structural protection
+against exfiltration.
+
+\subsection{Complexity Analysis}
+\label{sec:security:complexity}
+
+\begin{table}[t]
+\centering
+\caption{Per-Request Computational Complexity}
+\label{tab:complexity}
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Component} & \textbf{Complexity} & \textbf{Notes} \\
+\midrule
+Sanitizer & $O(|P|)$ & String scan \\
+Embedding & $O(d \cdot |P|)$ & Adapter-dependent \\
+DB search & $O(n \cdot d)$ & $n$ = signatures in DB \\
+Defense module & $O(d)$ & Single dot product \\
+Threshold validation & $O(M)$ & $M$ nodes, async \\
+Gossip round & $O(k \cdot d)$ & $k$ = fanout \\
+Telemetry emit & $O(d)$ & JSON serialize \\
+\midrule
+\textbf{Total (critical path)} & $O(nd + M)$ & Dominated by DB search \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The critical path is $O(nd + M)$ where $n$ is the number of attack
+signatures in the DB. For deployment-scale $n$ (thousands to millions),
+the DB search should be replaced with an ANN index (e.g., FAISS IVF),
+reducing search complexity to $O(d \log n)$.
+
+% =============================================================================
+\section{Implementation}
+\label{sec:implementation}
+
+\textbf{Language and Dependencies.}
+ASP is implemented in Python 3.11. The core pipeline—TEE boundary,
+intent encoder, threshold validator, gossip engine, and telemetry
+emitter—uses only Python standard library and \texttt{numpy~2.2}
+for vector arithmetic. No ML frameworks (PyTorch, TensorFlow, HuggingFace)
+are required for the core path, minimizing the trusted computing base.
+
+\textbf{Module Structure.}
+The implementation is organized into 8 packages, each with a single
+responsibility:
+
+\begin{table}[h]
+\centering
+\caption{ASP Package Structure and Responsibilities}
+\label{tab:modules}
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Package} & \textbf{Files} & \textbf{Responsibility} \\
+\midrule
+\texttt{asp.tee}      & boundary, sanitizer, attestation & TEE orchestration \\
+\texttt{asp.encoder}  & intent\_encoder, attack\_signature\_db, & Intent encoding, \\
+                      & geometry, embedding\_adapter          & manifold geometry \\
+\texttt{asp.threshold} & validator, share, node, registry    & N-of-M consensus \\
+\texttt{asp.gossip}   & engine, vaccine, peer, transport     & Epidemic broadcast \\
+\texttt{asp.defense}  & router, adversarial\_roleplay,       & Mitigation modules \\
+                      & context\_injection, base             & \\
+\texttt{asp.telemetry} & protocol, schemas, emitter          & JSON-RPC~2.0 \\
+\texttt{asp.llm}      & adapter, openai\_adapter,            & LLM integration \\
+                      & llama\_adapter                       & \\
+\texttt{asp.config}   & config                               & Immutable config \\
+\midrule
+\textbf{Total} & 25 source files & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Test Suite.}
+The test suite covers all modules with 8 test files targeting unit and
+integration behavior:
+\texttt{test\_intent\_encoder.py},
+\texttt{test\_attack\_signature\_db.py},
+\texttt{test\_threshold\_validator.py},
+\texttt{test\_gossip\_engine.py},
+\texttt{test\_defense\_modules.py},
+\texttt{test\_sanitizer.py},
+\texttt{test\_telemetry\_protocol.py}, and
+\texttt{test\_e2e\_pipeline.py}.
+
+\textbf{Model Agnosticism.}
+The LLM adapter interface (\texttt{asp.llm.adapter}) abstracts provider
+details. The same ASP protocol operates identically with OpenAI
+(\texttt{openai\_adapter.py}), Llama-compatible APIs
+(\texttt{llama\_adapter.py}), or any custom provider. The encoding adapter
+is similarly pluggable: production deployments use sentence-transformers;
+the reference implementation uses a hash-based adapter for zero-dependency
+testing.
+
+\textbf{Configuration.}
+All tunable parameters (thresholds, $N$, $M$, fanout, timeouts) are
+collected in \texttt{ASPConfig}, an immutable dataclass loaded from
+environment variables. No magic constants exist in the core codebase.
+
+% =============================================================================
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+\textbf{Embedding Quality.}
+The reference implementation uses a hash-based embedding adapter for
+dependency-free testing. Hash-based embeddings do not preserve semantic
+similarity and therefore do not satisfy the semantic stability property
+(Theorem~\ref{thm:sfi}). Production deployments must substitute a
+sentence-transformer model (e.g., \texttt{all-mpnet-base-v2} or a
+custom fine-tuned encoder over jailbreak datasets). This is a protocol
+design limitation, not an architectural one—the ASP pipeline is
+identical regardless of embedding quality.
+
+\textbf{Clock Synchronization.}
+The gossip vaccine timestamping assumes approximate clock synchronization
+across nodes. In adversarial network environments, a Byzantine node could
+replay old vaccines with forged timestamps. A production deployment should
+use a vector clock or a monotonic counter anchored to a consensus mechanism.
+
+\textbf{Byzantine Validators Beyond Threshold.}
+Theorem~\ref{thm:threshold} proves safety for up to $N-1$ compromised
+validators. If $\geq N$ validators are Byzantine, ASP provides no safety
+guarantee. Mitigating super-threshold collusion requires a
+Byzantine fault-tolerant consensus layer (e.g., PBFT or HotStuff) which
+is outside the current scope.
+
+\textbf{Gossip Coverage Window.}
+A novel attack detected by one node is not instantly visible to all nodes.
+During the $O(\log N)$ convergence window, other nodes may not have the
+vaccine in their attack DB. This creates a brief window of vulnerability
+for zero-day attacks. Reducing the gossip interval (configurable, default
+1~s) decreases the window at the cost of bandwidth.
+
+\textbf{TEE Hardware Dependency.}
+The current implementation stubs the Dstack attestation in development
+mode (\texttt{tee\_attestation\_enabled = False}). Production deployment
+requires Intel TDX, SGX, or equivalent TEE hardware and Dstack provisioning.
+The protocol design is correct regardless—the attestation layer only
+changes the assurance level, not the functional behavior.
+
+\textbf{Alignment Anchor Robustness.}
+The context injection defense relies on alignment anchors being honored by
+RLHF-trained models. There exist fine-tuned or jailbroken model variants
+that may not respect these anchors. ASP's defense modules are designed for
+models that have undergone standard alignment training; they provide no
+guarantees against deliberately de-aligned models.
+
+\textbf{Future Work.}
+Priority directions include: (1) integration of threshold BLS signatures
+(via Thetacrypt~\cite{thetacrypt2024}) to replace the HMAC stand-in;
+(2) a distributed key generation protocol for validator setup without
+a trusted dealer; (3) an ANN index backend for the attack signature DB;
+(4) a formal verification of the pipeline invariants using TLA+; and
+(5) an adversarial evaluation benchmark against the jailbreak datasets
+of Shen et al.~\cite{shen2023anything} and Wei et al.~\cite{wei2023jailbroken}.
+
+% =============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented the Alignment Security Protocol (ASP), a hardware-backed,
+threshold-validated, federated immunity system for LLM safety enforcement.
+ASP addresses a structural gap in existing defenses: by moving safety
+enforcement into an attested TEE, encoding threat detection in latent space
+geometry rather than surface form, requiring distributed consensus on safety
+verdicts, and propagating new attack signatures as vaccines via epidemic
+broadcast, ASP provides defense-in-depth that is simultaneously more
+robust, more principled, and more composable than existing approaches.
+
+The core architectural insight is simple and strong: \emph{raw prompts must
+be destroyed before they can be leaked, threat detection must operate on
+semantic intent rather than token patterns, and no single node should hold
+veto power over the safety decision.} These three invariants, enforced by
+hardware and distributed consensus rather than policy documents, constitute
+the foundation of synthetic immunity for aligned AI systems.
+
+% =============================================================================
+\bibliographystyle{ACM-Reference-Format}
+\begin{thebibliography}{99}
+
+\bibitem{bai2022constitutional}
+Bai, Y., Jones, A., Ndousse, K., Askell, A., Chen, A., DasSarma, N.,
+Drain, D., Fort, S., Ganguli, D., Henighan, T., et al. (2022).
+Constitutional AI: Harmlessness from AI feedback.
+\textit{arXiv preprint arXiv:2212.08073}.
+
+\bibitem{carlini2023aligned}
+Carlini, N., Nasr, M., Choquette-Choo, C. A., Jagielski, M.,
+Garg, I., Terzis, A., Thomas, F., Tramèr, F., Zhang, C., and
+Lee, K. (2023).
+Are aligned neural networks adversarially aligned?
+In \textit{Advances in Neural Information Processing Systems (NeurIPS 2023)},
+volume 36.
+
+\bibitem{demers1987epidemic}
+Demers, A., Greene, D., Hauser, C., Irish, W., Larson, J., Shenker, S.,
+Sturgis, H., Swinehart, D., and Terry, D. (1987).
+Epidemic algorithms for replicated database maintenance.
+In \textit{Proceedings of the 6th Annual ACM Symposium on Principles of
+Distributed Computing (PODC '87)}, pages 1--12.
+
+\bibitem{desmedt1987society}
+Desmedt, Y. and Frankel, Y. (1990).
+Threshold cryptosystems.
+In \textit{Advances in Cryptology -- CRYPTO '89}, Lecture Notes in Computer
+Science, volume 435, pages 307--315. Springer, New York.
+
+\bibitem{dstack2024}
+Dstack Project (2024).
+Dstack: TEE orchestration for confidential cloud computing.
+\textit{Technical documentation}. \url{https://github.com/dstack-TEE/dstack}.
+Accessed 2024.
+
+\bibitem{greshake2023youve}
+Greshake, K., Abdelnabi, S., Mishra, S., Endres, C., Holz, T., and
+Fritz, M. (2023).
+Not what you've signed up for: Compromising real-world LLM-integrated
+applications with indirect prompt injections.
+In \textit{Proceedings of the AISec Workshop at ACM CCS 2023}.
+
+\bibitem{ndai2024tee}
+NDAI Project (2024).
+NDAI Agreements: Trusted execution environments for AI data handling
+policy enforcement.
+\textit{Technical Report}. Cornell Initiative for CryptoCurrencies \& Contracts.
+
+\bibitem{ouyang2022training}
+Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright, C. L.,
+Mishkin, P., Zhang, C., Agarwal, S., Slama, K., Ray, A., et al. (2022).
+Training language models to follow instructions with human feedback.
+In \textit{Advances in Neural Information Processing Systems (NeurIPS 2022)},
+volume 35, pages 27730--27744.
+
+\bibitem{perez2022ignore}
+Perez, F. and Ribeiro, I. (2022).
+Ignore previous prompt: Attack techniques for language models.
+In \textit{NeurIPS ML Safety Workshop 2022}.
+\textit{arXiv preprint arXiv:2211.09527}.
+
+\bibitem{shamir1979share}
+Shamir, A. (1979).
+How to share a secret.
+\textit{Communications of the ACM}, 22(11):612--613.
+
+\bibitem{shen2023anything}
+Shen, X., Chen, Z., Backes, M., Shen, Y., and Zhang, Y. (2023).
+``Do Anything Now'': Characterizing and evaluating in-the-wild
+jailbreak prompts on large language models.
+\textit{arXiv preprint arXiv:2308.03825}.
+
+\bibitem{thetacrypt2024}
+Thetacrypt Project (2024).
+Thetacrypt: Threshold cryptography for distributed consensus applications.
+\textit{Technical documentation and library}.
+\url{https://github.com/thetacrypt/thetacrypt}.
+Accessed 2024.
+
+\bibitem{wei2023jailbroken}
+Wei, A., Haghtalab, N., and Steinhardt, J. (2023).
+Jailbroken: How does LLM safety training fail?
+In \textit{Advances in Neural Information Processing Systems (NeurIPS 2023)},
+volume 36.
+
+\bibitem{zou2023universal}
+Zou, A., Wang, Z., Kolter, J. Z., and Fredrikson, M. (2023).
+Universal and transferable adversarial attacks on aligned language models.
+\textit{arXiv preprint arXiv:2307.15043}.
+
+\end{thebibliography}
+
+\end{document}

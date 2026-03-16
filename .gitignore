@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+*.html
+_patch_demo*.py
+temp_probe.py
+probe_*.py
+.ralph/autoresearch_log.jsonl
