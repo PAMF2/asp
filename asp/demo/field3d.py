@@ -1,26 +1,57 @@
 """
-PromptField3D and MemoryRegion — 3-D parametric probability field for
-prompt classification and online memory consolidation.
+PromptFieldND and MemoryRegion — N-dimensional parametric probability field
+for prompt classification and online memory consolidation.
 
-Extracted from viz_server.py so they can be imported without starting
+Generalized from the original 3D implementation. The number of dimensions,
+axis groupings, and seed regions are all configurable. The core math
+(Gaussian energy, analytic gradient, gradient-descent placement, novelty
+detection) works identically in any ℝⁿ.
+
+Extracted from viz_server.py so it can be imported without starting
 the HTTP demo server or instantiating the full ASP pipeline.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import threading
 
 
+# ---------------------------------------------------------------------------
+# Default configurations (backwards-compatible 3D)
+# ---------------------------------------------------------------------------
+
+DEFAULT_DIM_GROUPS: list[list[str]] = [
+    ["social_eng", "roleplay"],       # dim 0: authority / persona
+    ["injection",  "smuggling"],      # dim 1: technical bypass
+    ["exfiltration", "reframing"],    # dim 2: information extraction
+]
+
+DEFAULT_SEEDS: list[tuple[str, list[float]]] = [
+    ("benign",       [0.03, 0.03, 0.03]),
+    ("social_eng",   [0.90, 0.12, 0.08]),
+    ("roleplay",     [0.78, 0.08, 0.06]),
+    ("injection",    [0.12, 0.92, 0.08]),
+    ("smuggling",    [0.18, 0.82, 0.12]),
+    ("exfiltration", [0.08, 0.12, 0.92]),
+    ("reframing",    [0.14, 0.18, 0.80]),
+]
+
+
 @dataclass
 class MemoryRegion:
-    """A Gaussian blob in 3D probability space."""
-    center: "np.ndarray"   # shape (3,)
+    """An isotropic Gaussian blob in N-dimensional probability space.
+
+    G(p) = weight × exp( -‖p - center‖² / (2σ²) )
+
+    Works in any ℝⁿ — the dimension is determined by len(center).
+    """
+    center: "np.ndarray"   # shape (ndim,)
     label:  str
-    radius: float = 0.20   # sigma of Gaussian kernel
+    radius: float = 0.20   # σ of Gaussian kernel
     weight: float = 1.0    # amplified each time a new prompt is absorbed
     count:  int   = 1      # number of prompts absorbed into this region
 
@@ -30,91 +61,123 @@ class MemoryRegion:
         return float(self.weight * np.exp(-d2 / (2.0 * self.radius ** 2)))
 
 
-class PromptField3D:
+class PromptFieldND:
     """
-    3-D parametric probability field for prompt classification and
-    online memory consolidation.
+    N-dimensional parametric probability field for prompt classification
+    and online memory consolidation.
+
+    The number of dimensions is determined by len(dim_groups). Each
+    dimension maps one or more keyword categories to a scalar score
+    via tanh compression. The full math (Gaussian energy, analytic
+    gradient, gradient-descent optimization, novelty detection) is
+    dimension-agnostic.
+
+    Parameters
+    ----------
+    adapter : Any
+        Embedding adapter with _normalize(text) and _KEYWORDS dict.
+    dim_groups : list[list[str]] | None
+        Axis groupings — each inner list maps keyword categories to one
+        dimension.  Defaults to 3D (authority, bypass, extraction).
+    seeds : list[tuple[str, list[float]]] | None
+        Seed regions as (label, [coord_0, ..., coord_n]).  Must match
+        len(dim_groups).  Defaults to 7 canonical 3D prototypes.
+    sigma : float
+        Gaussian kernel width for new regions.
+    tanh_scale : float
+        Steepness of keyword density → score mapping.
+    novelty_threshold : float
+        Field energy below this → prompt is novel.
+    min_distance : float
+        Distance above this to nearest center → prompt is novel.
+    gd_steps : int
+        Gradient descent iterations for placement optimization.
+    gd_lr : float
+        Gradient descent learning rate.
 
     Public API
     ----------
-    n3(prompt, label) -> dict
-        Allocate a single prompt in the field.  Returns a result dict with
+    classify(prompt, label) -> dict
+        Allocate a single prompt in the field.  Returns result dict with
         keys: position, optimized, energy, distance, nearest_label, action,
-              region (MemoryRegion | None)
+              region (MemoryRegion | None), ndim
 
     field_state() -> list[dict]
         Return all current memory regions (for visualization / audit).
     """
 
-    # -- Axis groupings: which keyword categories feed each abstract dimension --
-    _DIM_GROUPS: list[list[str]] = [
-        ["social_eng", "roleplay"],       # dim 0: authority / persona
-        ["injection",  "smuggling"],      # dim 1: technical bypass
-        ["exfiltration", "reframing"],    # dim 2: information extraction
-    ]
-
-    # -- Tunable parameters (no hardcoded decision values inside the math) ------
-    # tanh scale: converts keyword density -> [0,1).  Higher = sharper gradient.
-    _TANH_SCALE: float = 15.0
-    # Field energy above this -> prompt is already well-explained -> discard
-    NOVELTY_THRESHOLD: float = 0.55
-    # Distance below this to nearest center -> too similar -> discard
-    MIN_DISTANCE: float = 0.12
-    # Gradient-descent step count and learning rate for placement optimisation
-    _GD_STEPS: int = 40
-    _GD_LR:    float = 0.04
-
-    def __init__(self, adapter: Any, sigma: float = 0.20) -> None:
+    def __init__(
+        self,
+        adapter: Any,
+        dim_groups: list[list[str]] | None = None,
+        seeds: list[tuple[str, list[float]]] | None = None,
+        sigma: float = 0.20,
+        tanh_scale: float = 15.0,
+        novelty_threshold: float = 0.55,
+        min_distance: float = 0.12,
+        gd_steps: int = 40,
+        gd_lr: float = 0.04,
+    ) -> None:
         self._adapter = adapter
-        self._sigma   = sigma
+        self._dim_groups = dim_groups or DEFAULT_DIM_GROUPS
+        self._ndim = len(self._dim_groups)
+        self._sigma = sigma
+        self._tanh_scale = tanh_scale
+        self._novelty_threshold = novelty_threshold
+        self._min_distance = min_distance
+        self._gd_steps = gd_steps
+        self._gd_lr = gd_lr
         self._memory: list[MemoryRegion] = []
         self._lock = threading.Lock()
-        self._seed_memory()
+        self._seed_memory(seeds)
+
+    @property
+    def ndim(self) -> int:
+        """Number of dimensions in this field."""
+        return self._ndim
 
     # -- Core mathematical components ------------------------------------------
 
     def _keyword_gradient(self, text: str) -> np.ndarray:
         """
-        Parametric 3D word-gradient without hardcoded axis scores.
+        Parametric N-D word-gradient.
 
-        For each abstract dimension d:
-            hits_d  = sum_{cat in DIM_GROUPS[d]}  |{kw : kw in normalize(text)}|
-            total_d = sum_{cat in DIM_GROUPS[d]}  |keywords(cat)|
-            score_d = tanh( hits_d / total_d  x  _TANH_SCALE )
+        For each dimension d:
+            hits_d  = max over cats in dim_groups[d] of (keyword hits / total keywords)
+            score_d = tanh( density × tanh_scale )
 
-        tanh is smooth, bounded [0, 1), and never hard-clips -- the gradient
-        compresses naturally near saturation, reflecting diminishing returns
-        from additional keyword hits.
+        tanh is smooth, bounded [0, 1), and compresses near saturation —
+        diminishing returns from additional keyword hits.
         """
         lower = self._adapter._normalize(text)
-        scores = np.zeros(3, dtype=np.float64)
+        scores = np.zeros(self._ndim, dtype=np.float64)
 
-        for dim_i, cats in enumerate(self._DIM_GROUPS):
+        for dim_i, cats in enumerate(self._dim_groups):
             best_density = 0.0
             for cat in cats:
-                kws     = self._adapter._KEYWORDS.get(cat, [])
-                hits    = sum(1 for kw in kws if kw.lower() in lower)
+                kws = self._adapter._KEYWORDS.get(cat, [])
+                hits = sum(1 for kw in kws if kw.lower() in lower)
                 density = hits / max(1, len(kws))
                 if density > best_density:
                     best_density = density
-            scores[dim_i] = float(np.tanh(best_density * self._TANH_SCALE))
+            scores[dim_i] = float(np.tanh(best_density * self._tanh_scale))
 
         return scores
 
     def _field_energy(self, point: np.ndarray) -> float:
-        """Sum_i G(point, m_i) -- total Gaussian field energy at a 3D position."""
+        """E(p) = Σ_i G(p, m_i) — total Gaussian field energy at position p."""
         return sum(m.gaussian(point) for m in self._memory)
 
     def _field_gradient(self, point: np.ndarray) -> np.ndarray:
         """
         Analytic gradient of the field energy w.r.t. position:
-            grad_E(p) = Sum_i  G(p, m_i) * (p - c_i) / sigma_i^2
+            ∇E(p) = Σ_i G(p, m_i) × (p - c_i) / σ_i²
 
-        Used for gradient-descent placement optimisation.
+        Used for gradient-descent placement optimization. Works in ℝⁿ.
         """
-        grad = np.zeros(3, dtype=np.float64)
+        grad = np.zeros(self._ndim, dtype=np.float64)
         for m in self._memory:
-            g    = m.gaussian(point)
+            g = m.gaussian(point)
             diff = point - m.center
             grad += g * diff / (m.radius ** 2)
         return grad
@@ -123,18 +186,17 @@ class PromptField3D:
         """
         Gradient descent from raw_pos toward nearest low-energy valley.
 
-        Minimises  E(p) = Sum_i G(p, m_i)  via  p <- p - lr * grad_E(p).
-        Clamps to [0, 1]^3 unit cube after each step.
-        Terminates early if ||grad_E|| < 1e-4 (flat region reached).
+        Minimizes E(p) = Σ_i G(p, m_i)  via  p ← p - lr × ∇E(p).
+        Clamps to [0, 1]ⁿ unit hypercube after each step.
+        Terminates early if ‖∇E‖ < 1e-4 (flat region reached).
         """
-        p  = raw_pos.copy().astype(np.float64)
-        lr = self._GD_LR
+        p = raw_pos.copy().astype(np.float64)
 
-        for _ in range(self._GD_STEPS):
+        for _ in range(self._gd_steps):
             g = self._field_gradient(p)
             if np.linalg.norm(g) < 1e-4:
                 break
-            p = p - lr * g
+            p = p - self._gd_lr * g
             p = np.clip(p, 0.0, 1.0)
 
         return p
@@ -144,35 +206,35 @@ class PromptField3D:
         if not self._memory:
             return -1, float("inf"), "none"
         dists = [float(np.linalg.norm(point - m.center)) for m in self._memory]
-        idx   = int(np.argmin(dists))
+        idx = int(np.argmin(dists))
         return idx, dists[idx], self._memory[idx].label
 
-    # -- Public API -------------------------------------------------------------
+    # -- Public API -----------------------------------------------------------
 
-    def n3(self, prompt: str, label: str = "unknown") -> dict:
+    def classify(self, prompt: str, label: str = "unknown") -> dict:
         """
-        Allocate prompt p1 in the 3D field.
+        Allocate prompt in the N-D field.
 
         Steps
         -----
-        1. raw_pos   <- keyword_gradient(prompt)         initial 3D position
-        2. opt_pos   <- optimize_placement(raw_pos)       energy-valley descent
-        3. energy    <- field_energy(opt_pos)             field pressure
-        4. nearest   <- nearest_region(opt_pos)           closest existing region
-        5. decision  -> NOVEL if energy < threshold AND distance > min_dist
-                     -> REDUNDANT otherwise
+        1. raw_pos  ← keyword_gradient(prompt)        initial ℝⁿ position
+        2. opt_pos  ← optimize_placement(raw_pos)     energy-valley descent
+        3. energy   ← field_energy(opt_pos)            field pressure
+        4. nearest  ← nearest_region(opt_pos)          closest Gaussian blob
+        5. decision → NOVEL if energy < threshold AND distance > min_dist
+                    → REDUNDANT otherwise (absorbed into nearest region)
 
-        Returns dict with full telemetry.  Thread-safe.
+        Returns dict with full telemetry. Thread-safe.
         """
         with self._lock:
-            raw_pos                    = self._keyword_gradient(prompt)
-            opt_pos                    = self._optimize_placement(raw_pos)
-            energy                     = self._field_energy(opt_pos)
-            near_idx, distance, n_lbl  = self._nearest_region(opt_pos)
+            raw_pos = self._keyword_gradient(prompt)
+            opt_pos = self._optimize_placement(raw_pos)
+            energy = self._field_energy(opt_pos)
+            near_idx, distance, n_lbl = self._nearest_region(opt_pos)
 
             novel = (
                 near_idx == -1
-                or (distance > self.MIN_DISTANCE and energy < self.NOVELTY_THRESHOLD)
+                or (distance > self._min_distance and energy < self._novelty_threshold)
             )
 
             result: dict = {
@@ -182,6 +244,7 @@ class PromptField3D:
                 "distance":      round(distance, 6),
                 "nearest_label": n_lbl,
                 "nearest_idx":   near_idx,
+                "ndim":          self._ndim,
                 "action":        None,
                 "region":        None,
             }
@@ -198,7 +261,7 @@ class PromptField3D:
                 result["action"] = "memorized"
                 result["region"] = m1
             else:
-                m        = self._memory[near_idx]
+                m = self._memory[near_idx]
                 m.center = (m.center * m.count + opt_pos) / (m.count + 1)
                 m.count += 1
                 m.weight = min(3.0, m.weight + 0.1)
@@ -206,8 +269,11 @@ class PromptField3D:
 
             return result
 
+    # Backwards-compatible alias
+    n3 = classify
+
     def field_state(self) -> list[dict]:
-        """Return all memory regions as serialisable dicts (for visualisation)."""
+        """Return all memory regions as serializable dicts."""
         with self._lock:
             return [
                 {
@@ -220,29 +286,30 @@ class PromptField3D:
                 for m in self._memory
             ]
 
-    # -- Seed initial field with canonical prototype regions --------------------
+    # -- Seed initial field ---------------------------------------------------
 
-    def _seed_memory(self) -> None:
+    def _seed_memory(self, seeds: list[tuple[str, list[float]]] | None) -> None:
         """
-        Place canonical prototype regions at known positions in the unit cube.
+        Place canonical prototype regions at known positions in [0,1]ⁿ.
         Seeds give the gradient-descent optimizer initial basins to flow toward.
-
-        Coordinates: (dim0=authority, dim1=bypass, dim2=extraction)
         """
-        seeds: list[tuple[str, float, float, float]] = [
-            ("benign",       0.03, 0.03, 0.03),
-            ("social_eng",   0.90, 0.12, 0.08),
-            ("roleplay",     0.78, 0.08, 0.06),
-            ("injection",    0.12, 0.92, 0.08),
-            ("smuggling",    0.18, 0.82, 0.12),
-            ("exfiltration", 0.08, 0.12, 0.92),
-            ("reframing",    0.14, 0.18, 0.80),
-        ]
-        for label, d0, d1, d2 in seeds:
+        seed_list = seeds or DEFAULT_SEEDS
+        for label, coords in seed_list:
+            if len(coords) != self._ndim:
+                raise ValueError(
+                    f"Seed '{label}' has {len(coords)} coords but field has "
+                    f"{self._ndim} dimensions"
+                )
             self._memory.append(MemoryRegion(
-                center=np.array([d0, d1, d2], dtype=np.float64),
+                center=np.array(coords, dtype=np.float64),
                 label=label,
                 radius=self._sigma,
                 weight=1.5,
                 count=1,
             ))
+
+
+# ---------------------------------------------------------------------------
+# Backwards compatibility: PromptField3D is just PromptFieldND with defaults
+# ---------------------------------------------------------------------------
+PromptField3D = PromptFieldND
